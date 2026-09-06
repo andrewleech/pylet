@@ -8,7 +8,11 @@ version = "0.0.1"
 description = "Compile Python programs to small self-contained native binaries via MicroPython"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+# 3.11.4 is the floor, not 3.11.0: tarfile's extraction-filter security fix
+# (PEP 706 / CVE-2007-4559 remediation) was backported to 3.11.4, and
+# picolet.cli._mpy_lib_cache relies on tarfile.extractall(filter="data")
+# unconditionally, with no pre-3.12 fallback path.
+requires-python = ">=3.11.4"
 authors = [
     { name = "Andrew Leech", email = "andrew@alelec.net" },
 ]
