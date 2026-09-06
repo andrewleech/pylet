@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT / "packages" / "picolet-cli"))
+sys.path.insert(0, str(_REPO_ROOT / "packages" / "picolet"))
 
 from picolet.cli.sbom_gen import (
     SbomViolation,
@@ -31,6 +31,7 @@ from picolet.cli.sbom_gen import (
     filter_components,
     load_mbm_prs,
     load_runtime_toml,
+    manifest_dep_components,
 )
 
 
@@ -448,6 +449,209 @@ class TestEmitAppSbom:
             f"Expected warn SbomViolation for MicroPython collision. Got: {violations}"
         assert "runtime" in warn_v[0].reason.lower() or "collide" in warn_v[0].reason.lower(), \
             f"Violation reason should mention collision context: {warn_v[0].reason}"
+
+
+# ---------------------------------------------------------------------------
+# manifest_dep_components: manifest.py require()'d packages -> CDX components
+# ---------------------------------------------------------------------------
+
+class TestManifestDepComponents:
+    """manifest_dep_components(): the code path that closes the SBOM/license
+    gate for build_cmd._resolve_app_manifest's required_packages."""
+
+    def test_known_spdx_license_uses_id_field(self):
+        records = [{
+            "name": "something", "version": "0.1.0", "license": "MIT",
+            "description": "", "author": "",
+        }]
+        components = manifest_dep_components(records, offset=0)
+        assert len(components) == 1
+        lic = components[0]["licenses"][0]["license"]
+        assert lic.get("id") == "MIT"
+        assert "name" not in lic
+
+    def test_missing_license_uses_licenseref_unknown_name_field(self):
+        records = [{
+            "name": "something", "version": "0.1.0", "license": None,
+            "description": "", "author": "",
+        }]
+        components = manifest_dep_components(records, offset=0)
+        lic = components[0]["licenses"][0]["license"]
+        assert lic.get("name") == "LicenseRef-Unknown"
+        assert "id" not in lic
+
+    def test_explicit_licenseref_prefixed_value_uses_name_field(self):
+        records = [{
+            "name": "something", "version": "0.1.0", "license": "LicenseRef-Proprietary",
+            "description": "", "author": "",
+        }]
+        components = manifest_dep_components(records, offset=0)
+        lic = components[0]["licenses"][0]["license"]
+        assert lic.get("name") == "LicenseRef-Proprietary"
+
+    def test_link_type_is_always_static(self):
+        records = [{"name": "something", "version": "0.1.0", "license": "MIT",
+                    "description": "", "author": ""}]
+        components = manifest_dep_components(records, offset=0)
+        link_props = [p for p in components[0]["properties"] if p["name"] == "picolet:link_type"]
+        assert link_props == [{"name": "picolet:link_type", "value": "static"}]
+
+    def test_bom_refs_offset_and_unique(self):
+        records = [
+            {"name": "foo", "version": "1.0", "license": "MIT", "description": "", "author": ""},
+            {"name": "bar", "version": "2.0", "license": "MIT", "description": "", "author": ""},
+        ]
+        components = manifest_dep_components(records, offset=5)
+        refs = [c["bom-ref"] for c in components]
+        assert refs == ["manifest-foo-5", "manifest-bar-6"]
+
+    def test_empty_records_returns_empty_list(self):
+        assert manifest_dep_components([], offset=0) == []
+
+
+# ---------------------------------------------------------------------------
+# emit_app_sbom(manifest_dependencies=...): integration with the full
+# collision + policy pipeline
+# ---------------------------------------------------------------------------
+
+class TestEmitAppSbomManifestDependencies:
+    def _emit_app(
+        self,
+        app_data: dict,
+        manifest_dependencies: "list[dict] | None" = None,
+        target: str = "linux-x64",
+        variant: str = "cli",
+    ) -> tuple[dict, list[SbomViolation]]:
+        out = Path(tempfile.mktemp(suffix=".cdx.json"))
+        violations = emit_app_sbom(
+            output_path=out,
+            runtime_sbom_path=None,
+            app_data=app_data,
+            target=target,
+            variant=variant,
+            repo_root=_REPO_ROOT,
+            manifest_dependencies=manifest_dependencies,
+        )
+        return json.loads(out.read_text()), violations
+
+    def test_manifest_dependency_appears_in_sbom(self):
+        app_data = {"app": {"name": "myapp", "version": "0.1.0"}}
+        doc, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "something", "version": "0.1.0", "license": "MIT",
+                "description": "", "author": "",
+            }],
+        )
+        names = [c["name"] for c in doc["components"]]
+        assert "something" in names
+        assert violations == []
+
+    def test_no_manifest_dependencies_is_backward_compatible(self):
+        """Omitting manifest_dependencies (existing callers) changes nothing."""
+        app_data = {"app": {"name": "myapp", "version": "0.1.0"}}
+        doc, violations = self._emit_app(app_data, manifest_dependencies=None)
+        names = [c["name"] for c in doc["components"]]
+        assert "MicroPython" in names
+        assert violations == []
+
+    def test_unknown_license_manifest_dependency_fails_with_fail_unknown(self):
+        """A require()'d package with no metadata(license=...) call, combined
+        with [sbom] fail_unknown=true, must fail the build; this is the
+        actual enforcement path that closes the SBOM/license policy gate for
+        manifest.py-resolved packages (must-fix #4)."""
+        app_data = {
+            "app": {"name": "myapp", "version": "0.1.0"},
+            "sbom": {"fail_unknown": True},
+        }
+        doc, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "something", "version": "0.1.0", "license": None,
+                "description": "", "author": "",
+            }],
+        )
+        fail_v = [v for v in violations if v.severity == "fail" and v.component == "something"]
+        assert fail_v, f"Expected a fail violation for unlicensed 'something'. Got: {violations}"
+        comp = next(c for c in doc["components"] if c["name"] == "something")
+        assert comp["licenses"][0]["license"]["name"] == "LicenseRef-Unknown"
+
+    def test_unknown_license_manifest_dependency_warns_by_default(self):
+        """Default policy (warn_unknown=True, fail_unknown=False): a warning,
+        not a build failure."""
+        app_data = {"app": {"name": "myapp", "version": "0.1.0"}}
+        _, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "something", "version": "0.1.0", "license": None,
+                "description": "", "author": "",
+            }],
+        )
+        warn_v = [v for v in violations if v.severity == "warn" and v.component == "something"]
+        fail_v = [v for v in violations if v.severity == "fail"]
+        assert warn_v, f"Expected a warn violation. Got: {violations}"
+        assert not fail_v
+
+    def test_disallowed_known_license_fails_regardless_of_fail_unknown(self):
+        """A manifest dependency with a real but disallowed SPDX id fails,
+        same as any other component, not just the LicenseRef-Unknown case."""
+        app_data = {
+            "app": {"name": "myapp", "version": "0.1.0"},
+            "sbom": {"allow_licences": ["MIT"]},
+        }
+        _, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "something", "version": "0.1.0", "license": "GPL-3.0-only",
+                "description": "", "author": "",
+            }],
+        )
+        fail_v = [v for v in violations if v.severity == "fail" and v.component == "something"]
+        assert fail_v, f"Expected fail violation for disallowed GPL-3.0-only. Got: {violations}"
+
+    def test_manifest_dependency_name_collision_with_runtime_component(self):
+        """A require()'d package that happens to share a name with a runtime
+        SBOM component (e.g. MicroPython) produces both entries plus a warn
+        violation, the same as an app [dependencies] collision; this is
+        new code (declared_app_components merge), not just a re-run of the
+        existing [dependencies] collision path."""
+        app_data = {"app": {"name": "myapp", "version": "0.1.0"}}
+        doc, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "MicroPython", "version": "9.9.9", "license": "MIT",
+                "description": "", "author": "",
+            }],
+        )
+        mp_components = [c for c in doc["components"] if c["name"] == "MicroPython"]
+        assert len(mp_components) == 2, \
+            f"Expected 2 MicroPython entries (runtime + manifest), got {len(mp_components)}"
+        refs = [c["bom-ref"] for c in mp_components]
+        assert refs[0] != refs[1]
+        assert any(r.startswith("app-") for r in refs)
+
+        warn_v = [v for v in violations if v.severity == "warn" and v.component == "MicroPython"]
+        assert warn_v, f"Expected warn SbomViolation for MicroPython collision. Got: {violations}"
+
+    def test_manifest_dependency_and_declared_dependency_both_present(self):
+        """[dependencies] and manifest.py require() results are independent
+        sources merged into the same SBOM, not mutually exclusive."""
+        app_data = {
+            "app": {"name": "myapp", "version": "0.1.0"},
+            "dependencies": {"declared-dep": "1.0"},
+            "dependency_meta": {"declared-dep": {"licence": "MIT"}},
+        }
+        doc, violations = self._emit_app(
+            app_data,
+            manifest_dependencies=[{
+                "name": "manifest-dep", "version": "2.0", "license": "MIT",
+                "description": "", "author": "",
+            }],
+        )
+        names = {c["name"] for c in doc["components"]}
+        assert "declared-dep" in names
+        assert "manifest-dep" in names
+        assert violations == []
 
 
 # ---------------------------------------------------------------------------

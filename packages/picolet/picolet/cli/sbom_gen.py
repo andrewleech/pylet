@@ -30,11 +30,15 @@ AD4: Enforcement defaults match docs/sbom.md allowlist table.
 AD5: build-runtime.sh calls the CLI shim on the host shell after the
      Docker container exits (Risk 1 mitigation).
 
-[PH13] Caveat: micropython-lib manifest parsing for frozen-module
-auto-discovery is deferred.  Users declare micropython-lib modules in
-[dependencies] / [dependency_meta] instead.  The SBOM is still fully
-valid — the caveat only means the generator does not auto-discover
-frozen modules from a manifest file.
+[PH13] Caveat: [dependencies] declarations are not auto-discovered from an
+app's own manifest.py; users still declare micropython-lib modules pulled
+in that way under [dependencies] / [dependency_meta] if they want them
+represented that way. This is a separate, narrower mechanism from
+manifest_dep_components() below, which does derive real CycloneDX
+components directly from an app's manifest.py require() calls (see
+build_cmd._resolve_app_manifest); that path closes the SBOM/license gate
+for manifest.py-resolved packages; this caveat is about the older
+[dependencies]-table-driven auto-discovery only.
 """
 
 from __future__ import annotations
@@ -508,6 +512,56 @@ def upylib_components(
     return components
 
 
+def manifest_dep_components(records: list[dict], offset: int) -> list[dict]:
+    """Build CycloneDX components for manifest.py require()'d packages.
+
+    records is a list of plain dicts (name, version, license, description,
+    author) built by build_cmd from the (name, ManifestPackageMetadata)
+    pairs a manifest.py's require() calls produced; see
+    build_cmd._resolve_app_manifest / _LazyManifestFile.required_packages.
+
+    link_type is always "static": everything manifest.py resolves is
+    compiled and frozen into the romfs the same way as every other source
+    picolet build packages, so it is checked against allow_licences (not
+    allow_dynamic) by _enforce_policy, and a missing metadata(license=...)
+    call yields LicenseRef-Unknown, subject to warn_unknown/fail_unknown
+    like any other unknown-licence component. This is what actually closes
+    the SBOM/license policy gate for third-party code pulled in via
+    require(); without this, that code would be frozen into the shipped
+    binary with no license review at all.
+    """
+    components: list[dict] = []
+    for i, rec in enumerate(records):
+        name = rec["name"]
+        version = str(rec.get("version") or "unknown")
+        licence = rec.get("license") or "LicenseRef-Unknown"
+        description = rec.get("description") or ""
+        author = rec.get("author") or ""
+
+        bom_ref = f"manifest-{name.lower().replace('-', '_').replace('.', '_')}-{offset + i}"
+        cdx: dict[str, Any] = {
+            "type": "library",
+            "bom-ref": bom_ref,
+            "name": name,
+            "version": version,
+        }
+        if licence.startswith("LicenseRef-"):
+            cdx["licenses"] = [{"license": {"name": licence}}]
+        else:
+            cdx["licenses"] = [{"license": {"id": licence}}]
+        properties = [
+            {"name": "picolet:link_type", "value": "static"},
+            {"name": "picolet:source", "value": "manifest.py require()"},
+        ]
+        if author:
+            properties.append({"name": "picolet:author", "value": author})
+        cdx["properties"] = properties
+        if description:
+            cdx["description"] = description
+        components.append(cdx)
+    return components
+
+
 # ---------------------------------------------------------------------------
 # Public: emit_runtime_sbom
 # ---------------------------------------------------------------------------
@@ -564,6 +618,7 @@ def emit_app_sbom(
     variant: str,
     repo_root: Path,
     artifact_path: "Path | None" = None,
+    manifest_dependencies: "list[dict] | None" = None,
 ) -> list[SbomViolation]:
     """Merge runtime + app deps; enforce policy; write CycloneDX 1.5 SBOM.
 
@@ -585,6 +640,11 @@ def emit_app_sbom(
     artifact_path:
         Path to the built application binary.  When provided and the file
         exists, a SHA-256 hash is attached to ``metadata.component.hashes``.
+    manifest_dependencies:
+        Plain-dict records (name/version/license/description/author) for
+        packages an app's manifest.py pulled in via require(); see
+        manifest_dep_components(). None or empty when the app has no
+        manifest.py, or its manifest.py used no require().
 
     Returns
     -------
@@ -609,17 +669,24 @@ def emit_app_sbom(
             runtime_cdx_components.append(_to_cdx_component(entry, bom_ref))
         _inject_mbm_prs(runtime_cdx_components, pr_titles)
 
-    # Step 2 — Build the app dependency component list.
+    # Step 2 — Build the app dependency component list ([dependencies] table
+    # plus manifest.py require() calls; both go through the same collision
+    # + policy pipeline below).
     app_cdx_components = _app_dep_components(
         app_data, offset=len(runtime_cdx_components), repo_root=repo_root
     )
+    manifest_cdx_components = manifest_dep_components(
+        manifest_dependencies or [],
+        offset=len(runtime_cdx_components) + len(app_cdx_components),
+    )
+    declared_app_components = app_cdx_components + manifest_cdx_components
 
     # Step 3 — Merge; detect name collisions and keep both with warning.
     runtime_by_name: dict[str, dict] = {c["name"]: c for c in runtime_cdx_components}
     collision_violations: list[SbomViolation] = []
     merged = list(runtime_cdx_components)
     seen_names: set[str] = set(runtime_by_name.keys())
-    for comp in app_cdx_components:
+    for comp in declared_app_components:
         name = comp["name"]
         if name in runtime_by_name:
             # Collision: preserve both entries.  Rewrite bom-ref to avoid
@@ -639,7 +706,8 @@ def emit_app_sbom(
                 severity="warn",
                 component=name,
                 reason=(
-                    f"app [dependencies] declaration collides with runtime component "
+                    f"app-declared component (from [dependencies] or manifest.py "
+                    f"require()) collides with runtime component "
                     f"(runtime: {rt_version}/{rt_licence}; app: {app_version}/{app_licence})"
                 ),
             ))
