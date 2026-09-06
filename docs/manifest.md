@@ -1,278 +1,140 @@
 # manifest.py
 
-The `manifest.py` file declares what MicroPython freezes into your Picolet
-binary: which `.py` modules, which packages from `micropython-lib`, and
-which user C modules. The format is the same as upstream MicroPython
-uses for board manifests; `picolet build` invokes the standard manifest
-processor under the hood.
+`manifest.py`, placed next to `picolet.toml` at the app root, declares extra Python sources for `picolet build` to freeze into the romfs: packages pulled from `micropython-lib` via `require()`, local packages registered via `add_library()`, and individual files via `module()`/`package()`. It is auto-detected: if `manifest.py` exists at the app root, `picolet build` processes it. No `picolet.toml` key or CLI flag is needed to opt in.
 
-The authoritative reference is the upstream MicroPython documentation:
-**[Manifest files](https://docs.micropython.org/en/latest/reference/manifest.html)**.
-This page is a Picolet-flavoured quick reference plus pointers for the
-common cases.
+The manifest is executed by the same manifest-processing module MicroPython itself uses for board manifests (vendored at `packages/picolet/picolet/_vendor/manifestfile.py`; see the README there for provenance), running in `MODE_COMPILE`. That mode supports `metadata()`, `include()`, `require()`, `add_library()`, `package()`, and `module()`. `freeze()` and its variants (`freeze_as_str`, `freeze_as_mpy`, `freeze_mpy`) are not available in this mode; they belong to MicroPython's own firmware-build freezing pipeline, which Picolet does not use. Picolet apps declare frozen sources with `module()`/`package()`/`require()` instead.
 
 ## When do you need one
 
-For a single-file CLI tool, you don't:
+For a single-file app with no third-party dependencies, you don't need one: `[app] entry = "src/main.py"` plus `[romfs] include` already covers first-party sources and static assets.
 
-```bash
-picolet build hello.py        # no manifest needed
-```
-
-For anything beyond one script — multiple modules, third-party packages
-from `micropython-lib` or community sources, user C modules — a
-manifest is how you declare the inputs.
+A manifest.py is for the case where a module needs to come from `micropython-lib` (a stdlib polyfill, an ecosystem package) or from another local package that isn't already under the entry tree or a `[romfs] include` directory.
 
 ## Getting started
 
-Create `manifest.py` next to your `picolet.toml`:
-
 ```python
-# manifest.py
-metadata(
-    description="My picolet app",
-    version="0.1.0",
-)
+# manifest.py, next to picolet.toml
+metadata(version="0.1.0")
 
 require("argparse")              # micropython-lib stdlib polyfill
-require("pathlib")
-require("dataclasses")
-
-freeze("./src", "main.py")       # your entry point
-freeze("./src", "utils.py")      # additional first-party modules
-freeze("./src/sub", "lib.py")    # nested files OK
+module("extra.py")               # a first-party module outside the entry tree
 ```
+
+`metadata()` must be the first call in the manifest; `require()`/`module()`/`package()` all check that it already ran, and raise `manifestfile.ManifestFileError` if it hasn't.
 
 ```bash
-picolet build --manifest manifest.py
+picolet build
 ```
 
-Or reference the manifest from `picolet.toml`:
-
-```toml
-[app]
-name = "my-app"
-entry = "src/main.py"
-manifest = "manifest.py"
-```
-
-Then `picolet build` picks it up automatically — no `--manifest` flag
-needed.
+No flag or `picolet.toml` key is needed; `app_root/manifest.py` is picked up automatically.
 
 ## Function reference
 
-The manifest is a Python file evaluated in a sandbox that exposes these
-functions. Full details at the upstream docs linked above; this is the
-short version.
+### `metadata(version=None, description=None, license=None, author=None)`
 
-### `freeze(path, script=None, opt=0)`
-
-Freeze `.py` files from `path` into the build. `script=None` freezes
-every `.py` in the directory; pass a single filename to freeze just that
-file.
+Must be called first. Establishes the top-level manifest's metadata record.
 
 ```python
-freeze("./src")                          # all .py in src/
-freeze("./src", "main.py")               # only main.py
-freeze("./src/lib", "helpers.py")        # specific nested file
+metadata(version="0.2.1", description="My DFU flasher", license="MIT", author="Andrew Leech")
 ```
-
-`opt` is the bytecode optimisation level (0 = default, 3 = strip line
-numbers and assertions for smaller `.mpy` output).
 
 ### `require(name, library=None)`
 
-Pull a package by name from `micropython-lib` (or a registered custom
-library — see `add_library` below). The package's `manifest.py` is
-read, and its dependencies are resolved transitively.
+Pull a package by name.
 
 ```python
 require("argparse")
 require("dataclasses")
-require("typing")
+require("widget", library="vendor")   # from a library registered with add_library()
 ```
 
-Available stdlib polyfills include: `argparse`, `pathlib`,
-`dataclasses`, `typing`, `unittest`, `copy`, `decimal`, `fractions`,
-`pprint`, `shutil`, `traceback`, `warnings`, `contextlib`, `abc`,
-`enum`, `string`, `textwrap`, `urllib.parse`. See `docs/caveats.md`
-for the full compatibility list.
+Without `library=`, `require()` searches `micropython/`, `python-stdlib/`, and `python-ecosys/` under a micropython-lib checkout for a directory named `name` containing its own `manifest.py`. That checkout is resolved by `picolet build` as described in [MPY_LIB_DIR resolution](#mpy_lib_dir-resolution) below, which is the only thing in a manifest.py that can trigger a network fetch.
 
-### `package(package_path, files=None, base_path='.', opt=None)`
+With `library="name"`, resolution is scoped to a directory previously registered with `add_library()`. MPY_LIB_DIR is only involved if that directory's own path was itself derived from `$(MPY_LIB_DIR)` (see below); a purely local `add_library()` path never touches it.
 
-Freeze an entire package directory recursively (including `__init__.py`
-and sub-packages). Restrict with `files=[...]` if you want only some
-files.
+### `add_library(library, library_path, prepend=False)`
+
+Register a local directory that `require(..., library=library)` can search. `library_path` is resolved relative to the manifest.py that calls it.
 
 ```python
-package("./src/mypkg")                   # everything under mypkg/
-package("./src/mypkg", files=["a.py"])   # just a.py
+add_library("vendor", "./vendor")
+require("colorlog", library="vendor")
 ```
 
-### `module(module_path, base_path='.', opt=None)`
+The registered package still needs its own `manifest.py` at `<library_path>/<name>/manifest.py`.
 
-Freeze a single `.py` file as a top-level module. Equivalent to
-`freeze(base_path, module_path)` but reads more naturally for one-off
-modules.
+### `module(module_path, base_path=".", opt=None)`
+
+Freeze a single `.py` file as a top-level romfs entry.
 
 ```python
-module("utils.py", base_path="./src")
+module("extra.py")                      # ./extra.py, relative to this manifest.py
+module("helpers.py", base_path="lib")   # ./lib/helpers.py
+```
+
+### `package(package_path, files=None, base_path=".", opt=None)`
+
+Freeze a directory of `.py` files, preserving its internal structure.
+
+```python
+package("mypkg")                        # everything under ./mypkg/
+package("mypkg", files=["a.py"])        # just ./mypkg/a.py
 ```
 
 ### `include(manifest_path)`
 
-Compose manifests. Useful for sharing common bits across apps or for
-splitting a large manifest:
+Compose manifests: execute another manifest.py file (or directory containing one) as part of this one.
 
 ```python
 include("../common/base-manifest.py")
-include("./platform-specific.py")
 ```
 
-### `c_module(path)`
+## MPY_LIB_DIR resolution
 
-Declare a user C module by absolute or `$(VAR)`-relative path. Each
-module directory needs a `micropython.mk` (or `micropython.cmake`).
+A bare `require("name")` (no `library=`) needs a local `micropython-lib` checkout to search; so does `require(name, library="x")` when `"x"` was itself registered via `add_library("x", "$(MPY_LIB_DIR)/...")`. `picolet build` resolves one automatically, lazily, only the first time a `require()` call in the manifest actually needs it:
 
-```python
-c_module("$(BOARD_DIR)/drivers/sensor")
-c_module("$(MPY_DIR)/../my-c-modules/cexample")
+1. `PICOLET_MPY_LIB_DIR` environment variable, if set, used as-is: checked for existence and for looking like a real micropython-lib checkout (at least one of `micropython/`, `python-stdlib/`, `python-ecosys/` present as a subdirectory), but not otherwise validated.
+2. `[build].mpy_lib_dir` in `picolet.toml`, if set, at the same trust level as (1). A relative path resolves against the app root (the directory containing `picolet.toml`), not the current working directory.
+3. Otherwise, `picolet build` fetches and caches a pinned `micropython-lib` commit into `<cache_root>/micropython-lib/<sha>/`, using the same cache root `picolet build` already uses for runtime artifacts (`PICOLET_CACHE_DIR`, or `$XDG_CACHE_HOME/picolet`/`~/.cache/picolet` on Linux, `%LOCALAPPDATA%\picolet\cache` on Windows). The fetched content is verified against a pinned digest before it is trusted; a mismatch fails the build rather than freezing unverified code into it. The fetch happens once; subsequent builds reuse the cached checkout with no network access.
+
+A manifest using only `module()`/`package()` and `add_library()`-registered local paths never triggers this at all, no matter how the manifest is structured (including through `include()`); the trigger is tied to the actual `require()` call, not to any static analysis of the manifest source.
+
+```toml
+# picolet.toml: pin a specific local checkout instead of the default fetch
+[build]
+mpy_lib_dir = "/opt/micropython-lib"
 ```
 
-This is the modern alternative to the legacy `USER_C_MODULES=<dir>`
-make-variable approach, which scans a single parent directory. With
-`c_module()` each module can live anywhere. Backed by upstream PR
-[micropython#18229](https://github.com/micropython/micropython/pull/18229),
-included in Picolet's mbm composition.
+## Collisions with app sources and `[romfs]` includes
 
-### `add_library(library, library_path, prepend=False)`
+Every `.py` file a manifest.py resolves is compiled to `.mpy` and placed in the romfs at the path `manifestfile.py` assigns it (e.g. `module("foo.py")` lands at `/foo.mpy`; `package("mypkg")` preserves `mypkg/`'s internal layout). If that destination path collides with a file compiled from the app's entry tree or from a `[romfs] include` directory, `picolet build` fails with an error naming both source paths; it does not pick one silently. A resolved destination is also rejected if it would land outside the romfs root entirely (e.g. a `module("../evil.py")`-style path) rather than silently writing there.
 
-Register a custom library directory so `require()` can find packages
-there. Default order: registered libraries are appended (lower
-priority than micropython-lib); pass `prepend=True` to override.
+## License review (SBOM)
 
-```python
-add_library("my-lib", "/abs/path/to/my-lib")
-require("widget", library="my-lib")
-```
+Every package pulled in via `require()` is represented in the build's CycloneDX SBOM (`<binary>.cdx.json`), using the `version`/`license`/`description`/`author` from that package's own `metadata()` call, and goes through the same `[sbom]` policy gate (`allow_licences`, `warn_unknown`, `fail_unknown`) as everything else `picolet build` links in. A package whose manifest never calls `metadata(license=...)` is treated as `LicenseRef-Unknown`, same as any other unlicensed dependency; see `docs/sbom.md`. `require(..., library=...)` against a local `add_library()` path is included the same way; there is no way for a `require()`'d package to be frozen into the binary without going through this gate.
 
-### `metadata(description=None, version=None, license=None, author=None)`
+## C modules
 
-Declare metadata for the manifest. Picked up by `picolet`'s SBOM
-emitter and surfaced in the output `.cdx.json`.
-
-```python
-metadata(
-    description="My DFU flasher",
-    version="0.2.1",
-    license="MIT",
-    author="Andrew Leech",
-)
-```
+`c_module()` is not supported in an app's `manifest.py`: `picolet build` processes manifest.py in `MODE_COMPILE`, which only handles Python sources, and calling `c_module()` there raises a build error rather than silently dropping the C module from the build.
 
 ## Community packages
 
-Beyond `micropython-lib`, the MicroPython community publishes packages
-on independent indexes. **[checkmim.com/packages](https://checkmim.com/packages)**
-is a searchable registry of MicroPython packages compatible with `mip`
-(MicroPython's runtime package installer).
-
-`mip` is for installing at runtime onto a live MicroPython filesystem;
-Picolet builds happen at compile time and freeze packages into the
-binary. To use a community package in a Picolet build:
-
-### Option 1 — `require()` with a custom library
-
-Clone the package source into a directory, register it with
-`add_library`, then `require` it:
+Packages that aren't in `micropython-lib`, whether vendored from elsewhere or pulled down ahead of time with `mpremote mip install` into a local directory, are used the same way as any other local package: register the directory with `add_library()` and `require()` it, or freeze it directly with `package()`/`module()` if it's simple enough not to need its own manifest.py.
 
 ```python
-# manifest.py
-add_library("community", "./vendor/community-pkgs")
-require("widget-toolkit", library="community")
+add_library("vendor", "./vendor")       # populated by: mpremote mip install --target ./vendor widget-toolkit
+require("widget-toolkit", library="vendor")
 ```
 
-The package needs its own `manifest.py` (or `package.json`) describing
-its contents. Most checkmim-listed packages do.
-
-### Option 2 — drop the source in tree and `freeze()` it
-
-For packages that are pure-Python and small, just copy the source into
-your app:
-
-```python
-freeze("./vendor/widget-toolkit")
-```
-
-You become responsible for licence attribution; declare it in your
-SBOM input (see `docs/sbom.md`).
-
-### Option 3 — fetch at build time
-
-Run `mip install` (via `mpremote`) into a build-time staging directory,
-then `freeze()` what landed there:
-
-```bash
-mpremote mip install --target ./vendor widget-toolkit
-```
-
-```python
-freeze("./vendor/widget-toolkit")
-```
-
-This is reproducible if you check `./vendor/` into the repo; otherwise
-the build depends on whatever the index has at build time.
-
-## Worked example: a CLI tool with a third-party dep
-
-```python
-# manifest.py
-metadata(version="1.0.0", license="MIT")
-
-# stdlib polyfills
-require("argparse")
-require("dataclasses")
-
-# community package (cloned into vendor/ by `mpremote mip install`)
-add_library("vendor", "./vendor")
-require("colorlog", library="vendor")
-
-# our own sources
-freeze("./src", "main.py")
-package("./src/utils")
-```
-
-```toml
-# picolet.toml
-[app]
-name = "my-tool"
-entry = "src/main.py"
-manifest = "manifest.py"
-```
-
-```bash
-mpremote mip install --target ./vendor colorlog
-picolet build
-./target/linux-x64/my-tool --help
-```
+The [License review (SBOM)](#license-review-sbom) section above applies here too: if the vendored package's own `manifest.py` doesn't set `license=` in its `metadata()` call, it shows up as `LicenseRef-Unknown` in the SBOM. Add a `license=` kwarg to that `metadata()` call (it's your vendored copy, so you can edit it) rather than trying to declare it separately; `[dependency_meta]` in `picolet.toml` is for the unrelated `[dependencies]` flat-table mechanism (see `docs/sbom.md`), not for `manifest.py`-resolved packages.
 
 ## Limits and gotchas
 
-- `freeze()`/`require()` declare what's frozen at build time — once the
-  binary is built, the contents are immutable. Runtime `mip.install`
-  inside the running binary requires writable filesystem and network,
-  neither of which a typical Picolet binary configures.
-- Frozen modules use less RAM than file-system modules (their bytecode
-  is in flash/ROM not heap), but they can't be reloaded — restart the
-  app to pick up a code change. `picolet dev` automates this.
-- Not all CPython libraries port cleanly to MicroPython. Check
-  `docs/caveats.md` for compatibility limits before committing to a
-  dep.
+- Everything a manifest.py resolves is fixed at build time. There is no runtime `mip.install` story for a Picolet binary; restart after a code change (`picolet dev` automates this for the entry tree, not for manifest.py-resolved packages, which only change when you edit the manifest or re-run build).
+- Not all CPython libraries port cleanly to MicroPython. Check `docs/caveats.md` before committing to a `require()`.
 
 ## See also
 
-- [Upstream MicroPython manifest reference](https://docs.micropython.org/en/latest/reference/manifest.html)
-- [micropython-lib README](https://github.com/micropython/micropython-lib/blob/master/README.md)
-- [checkmim.com](https://checkmim.com) — community MicroPython package index
-- [docs/caveats.md](caveats.md) — MicroPython vs CPython compatibility
-- [docs/cli-reference.md](cli-reference.md) — `picolet build --manifest` options
+- [docs/architecture.md](architecture.md): `[build]` schema, including `mpy_lib_dir`.
+- [docs/caveats.md](caveats.md): MicroPython vs CPython compatibility.
+- [packages/picolet/picolet/_vendor/README.md](../packages/picolet/picolet/_vendor/README.md): provenance of the vendored manifest processor.

@@ -169,6 +169,15 @@ variant = "mcp"             # explicit runtime-variant override; wins over
                              # (e.g. a stdio-only MCP server) — forcing it
                              # into the renderer concept would be wrong, so
                              # this is a separate, independent selector.
+mpy_lib_dir = "/opt/micropython-lib"
+                             # optional; overrides where manifest.py's require()
+                             # calls resolve micropython-lib packages from.
+                             # A relative path resolves against the app root.
+                             # Absent this key (and PICOLET_MPY_LIB_DIR),
+                             # picolet build fetches and caches a pinned
+                             # micropython-lib commit on first use, lazily,
+                             # only if a require() call actually needs it.
+                             # See docs/manifest.md.
 
 [romfs]
 include = ["ui", "assets"]
