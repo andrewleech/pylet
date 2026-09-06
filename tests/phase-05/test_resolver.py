@@ -937,6 +937,27 @@ class TestValidatorPackagingExtensions(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("variant", str(errors[0]))
 
+    def test_build_mpy_lib_dir_valid(self) -> None:
+        """[build].mpy_lib_dir, a manifest.py require() override path, is a valid str."""
+        import tempfile
+        from picolet.cli.validator import validate_toml
+
+        with tempfile.TemporaryDirectory() as d:
+            toml = self._make_toml(Path(d), '\n[build]\nmpy_lib_dir = "/opt/micropython-lib"\n')
+            errors = validate_toml(toml)
+        self.assertEqual(errors, [])
+
+    def test_build_mpy_lib_dir_wrong_type(self) -> None:
+        """[build].mpy_lib_dir with wrong type (integer) yields a validation error."""
+        import tempfile
+        from picolet.cli.validator import validate_toml
+
+        with tempfile.TemporaryDirectory() as d:
+            toml = self._make_toml(Path(d), "\n[build]\nmpy_lib_dir = 5\n")
+            errors = validate_toml(toml)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mpy_lib_dir", str(errors[0]))
+
     def test_romfs_exclude_valid(self) -> None:
         """[romfs].exclude alongside include passes validation."""
         import tempfile

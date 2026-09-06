@@ -84,6 +84,8 @@ _WINDOW_SCHEMA: dict[str, type | tuple[type, ...]] = {
 _BUILD_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "targets": list,
     "variant": str,   # explicit runtime-variant override; wins over [ui].renderer
+    "mpy_lib_dir": str,   # override for manifest.py require() resolution;
+                          # same precedence tier as PICOLET_MPY_LIB_DIR (env wins)
 }
 
 _ROMFS_SCHEMA: dict[str, type | tuple[type, ...]] = {

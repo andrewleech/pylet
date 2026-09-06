@@ -127,6 +127,7 @@ if [[ "$SKIP_UNIT" -eq 1 ]]; then
     skip "$NAME" "--skip-unit requested"
 else
     if python -m pytest "$SCRIPT_DIR/test_resolver.py" "$SCRIPT_DIR/test_build_cmd.py" \
+           "$SCRIPT_DIR/test_mpy_lib_cache.py" \
            -q --tb=short 2>&1 | tail -5; then
         pass "$NAME"
     else

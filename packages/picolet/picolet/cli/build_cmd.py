@@ -14,15 +14,20 @@ Pipeline (FR-BP-1 through FR-BP-6):
      (absent → cli) (FR-BP-1).
   4. Resolve target from --target or host auto-detection (FR-BP-1).
   5. Locate runtime artifact + mpy-cross, verify version match.
-  6. Compile user .py sources → .mpy via mpy-cross, applying [romfs].exclude
+  6. Resolve manifest.py, if present at the app root: require()/add_library()/
+     module()/package() are processed via the vendored MicroPython manifest
+     processor (picolet._vendor.manifestfile), in MODE_COMPILE.
+  7. Compile user .py sources → .mpy via mpy-cross, applying [romfs].exclude
      to skip test/example files living alongside the entry (FR-BP-3).
-  7. Copy [romfs] include dirs into staging, applying [romfs].exclude and
+  8. Compile manifest.py-resolved files → .mpy, sharing the same romfs-path
+     collision guard as steps 7 and 9.
+  9. Copy [romfs] include dirs into staging, applying [romfs].exclude and
      compiling any .py found there to .mpy too — an appended romfs never
      ships raw .py, regardless of which step put a file there (FR-BP-4).
-  8. Zero mtimes for reproducibility (FR-BP-6).
-  9. Build romfs image with mpremote (FR-BP-4).
- 10. Append romfs + 24-byte trailer to runtime binary (FR-BP-5).
- 11. Emit SBOM sibling .cdx.json (FR-SBOM-1, FR-SBOM-2, FR-SBOM-3).
+ 10. Zero mtimes for reproducibility (FR-BP-6).
+ 11. Build romfs image with mpremote (FR-BP-4).
+ 12. Append romfs + 24-byte trailer to runtime binary (FR-BP-5).
+ 13. Emit SBOM sibling .cdx.json (FR-SBOM-1, FR-SBOM-2, FR-SBOM-3).
 """
 
 from __future__ import annotations
@@ -39,7 +44,14 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import NamedTuple
 
+from picolet._vendor.manifestfile import (
+    ManifestFile,
+    ManifestFileError,
+    MODE_COMPILE,
+)
+from picolet.cli._mpy_lib_cache import ensure_mpy_lib_dir, mpy_lib_dir_path
 from picolet.cli._paths import find_picolet_toml as _find_picolet_toml
 from picolet.cli._targets import (
     SUPPORTED_RENDERERS,
@@ -357,7 +369,13 @@ def _do_build(args) -> int:
     _verify_mpy_cross_version(runtime_path, mpy_cross, args.verbose)
 
     # -------------------------------------------------------------------------
-    # Step 4b – Frontend build (FR-VUE-4, FR-VUE-5): run npm install + build
+    # Step 4b – Resolve manifest.py, if present at the app root (FR-CLI-8
+    # style pre-flight; no toml key required for the common case).
+    # -------------------------------------------------------------------------
+    resolved_manifest = _resolve_app_manifest(app_root, data, args.verbose)
+
+    # -------------------------------------------------------------------------
+    # Step 4c – Frontend build (FR-VUE-4, FR-VUE-5): run npm install + build
     # command when [ui.frontend].framework is non-vanilla.  No-op for vanilla.
     # -------------------------------------------------------------------------
     _run_frontend_build(data, app_root, args.verbose)
@@ -374,11 +392,27 @@ def _do_build(args) -> int:
     try:
         # Step 5 – Compile .py → .mpy (FR-BP-3).
         romfs_root = staging / "romfs"
-        _compile_mpy(app_root, entry, romfs_root, mpy_cross, romfs_excludes, args.verbose)
+        # Shared across steps 5-6a so a manifest.py require()'d module, an
+        # app source file, and a [romfs] include can't silently collide at
+        # the same romfs path; see _claim_mpy_dest.
+        mpy_sources: dict[Path, Path] = {}
+        _compile_mpy(
+            app_root, entry, romfs_root, mpy_cross, romfs_excludes, args.verbose,
+            mpy_sources=mpy_sources,
+        )
+
+        # Step 5a – Compile manifest.py-resolved files (require()/module()/
+        # package()), if a manifest.py was found in step 4b.
+        if resolved_manifest is not None:
+            _compile_manifest_files(
+                resolved_manifest.files, romfs_root, mpy_cross, args.verbose,
+                mpy_sources=mpy_sources,
+            )
 
         # Step 6 – Copy [romfs] include dirs, compiling .py -> .mpy (FR-BP-4).
         _copy_includes(
-            app_root, romfs_includes, romfs_excludes, romfs_root, mpy_cross, args.verbose
+            app_root, romfs_includes, romfs_excludes, romfs_root, mpy_cross, args.verbose,
+            mpy_sources=mpy_sources,
         )
 
         # Step 6a – For non-vanilla frontend frameworks, copy the built
@@ -476,6 +510,11 @@ def _do_build(args) -> int:
         sbom_path = output_path.parent / f"{output_path.name}.cdx.json"
         if args.verbose:
             print(f"  sbom: emitting {sbom_path}", file=sys.stderr)
+        manifest_dependencies = (
+            _manifest_sbom_records(resolved_manifest.required_packages)
+            if resolved_manifest is not None
+            else []
+        )
         violations = emit_app_sbom(
             output_path=sbom_path,
             runtime_sbom_path=resolved.sbom,
@@ -484,6 +523,7 @@ def _do_build(args) -> int:
             variant=variant,
             repo_root=_find_repo_root(),
             artifact_path=output_path,
+            manifest_dependencies=manifest_dependencies,
         )
         _handle_sbom_violations(violations, data, args.verbose)
         if args.verbose:
@@ -507,6 +547,26 @@ def _find_repo_root() -> Path:
     """
     here = Path(__file__).parent            # packages/picolet/picolet/cli/
     return here.parent.parent.parent.parent  # repo root
+
+
+def _manifest_sbom_records(required_packages: list[tuple[str, object]]) -> list[dict]:
+    """Convert (name, ManifestPackageMetadata) pairs to plain SBOM record dicts.
+
+    Feeds sbom_gen.manifest_dep_components(), which is what actually runs
+    manifest.py require()'d packages through the [sbom] allow_licences /
+    fail_unknown policy gate; without this, third-party code frozen into
+    the binary via require() would carry no license review at all.
+    """
+    records = []
+    for name, meta in required_packages:
+        records.append({
+            "name": name,
+            "version": getattr(meta, "version", None) or "unknown",
+            "license": getattr(meta, "license", None),
+            "description": getattr(meta, "description", None) or "",
+            "author": getattr(meta, "author", None) or "",
+        })
+    return records
 
 
 def _handle_sbom_violations(
@@ -952,6 +1012,44 @@ def _run_version_checks(data: dict, app_root: Path) -> None:
         raise BuildFailed()
 
 
+class ResolvedManifest(NamedTuple):
+    """Result of processing an app's manifest.py.
+
+    files: (abs_source_path, romfs_target_path) pairs to compile (see
+        _compile_manifest_files).
+    required_packages: (name, ManifestPackageMetadata) pairs, one per
+        require() call the manifest made (including transitively, through
+        nested include()s), fed to the SBOM/license policy gate so
+        third-party code pulled in this way doesn't bypass it.
+    """
+    files: list[tuple[Path, str]]
+    required_packages: list[tuple[str, object]]
+
+
+def _resolve_app_manifest(
+    app_root: Path, data: dict, verbose: bool
+) -> "ResolvedManifest | None":
+    """Resolve app_root/manifest.py, if present; else a no-op.
+
+    Returns None when no manifest.py exists at the app root; callers must
+    treat that identically to "manifest.py support does not exist", so an
+    app without one builds exactly as before this feature was added.
+    """
+    manifest_path = app_root / "manifest.py"
+    if not manifest_path.is_file():
+        return None
+
+    resolved = _resolve_manifest(app_root, manifest_path, data, verbose)
+    if verbose:
+        print(
+            f"  manifest: {len(resolved.files)} file(s), "
+            f"{len(resolved.required_packages)} require()'d package(s) "
+            f"resolved from manifest.py",
+            file=sys.stderr,
+        )
+    return resolved
+
+
 def _is_excluded(rel_parts: tuple[str, ...], excludes: list[str]) -> bool:
     """True if any path component (any depth) matches an fnmatch exclude pattern.
 
@@ -965,6 +1063,231 @@ def _is_excluded(rel_parts: tuple[str, ...], excludes: list[str]) -> bool:
     )
 
 
+def _claim_mpy_dest(
+    mpy_sources: dict[Path, Path], dst: Path, src: Path, romfs_root: Path
+) -> None:
+    """Record dst → src in a shared romfs-path collision-guard dict.
+
+    Raises BuildFailed naming both source paths when dst is already claimed
+    by a different source. Shared across _compile_mpy, _compile_manifest_files,
+    and _copy_includes so an entry-tree file, a manifest.py require()'d
+    module, and a [romfs] include can't silently collide at the same romfs
+    path (ambiguous which one would ship).
+
+    Also raises BuildFailed if dst resolves outside romfs_root entirely --
+    reachable from a manifest.py module()/package() call with a ".."-laden
+    path (e.g. module("../evil.py", base_path="sub")), where target_path is
+    used verbatim as the romfs destination with no bounds checking of its
+    own. .resolve() is used (not a lexical prefix check) because dst may
+    contain unresolved ".." components that a plain string/parts comparison
+    would not catch.
+    """
+    resolved_dst = dst.resolve()
+    resolved_root = romfs_root.resolve()
+    if resolved_root not in resolved_dst.parents:
+        print(
+            f"error: {src} resolves to a romfs destination outside the "
+            f"romfs root: {dst} (romfs root: {romfs_root})",
+            file=sys.stderr,
+        )
+        raise BuildFailed()
+
+    if dst in mpy_sources and mpy_sources[dst] != src:
+        print(
+            f"error: {mpy_sources[dst]} and {src} both resolve to "
+            f"romfs/{dst.relative_to(romfs_root)}; ship only one",
+            file=sys.stderr,
+        )
+        raise BuildFailed()
+    mpy_sources[dst] = src
+
+
+def _mpy_cross_compile(
+    mpy_cross: Path, src: Path, dst: Path, verbose: bool, *, label: "str | None" = None
+) -> None:
+    """Compile src → dst via mpy-cross, creating dst's parent dir as needed.
+
+    label overrides the verbose progress line (default: full src/dst paths);
+    callers with a shorter, romfs-relative description pass one for
+    readability.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if verbose:
+        print(f"  mpy-cross: {label if label is not None else f'{src} → {dst}'}", file=sys.stderr)
+    subprocess.run(
+        [str(mpy_cross), "-o", str(dst), str(src)],
+        check=True,
+        capture_output=not verbose,
+    )
+
+
+class _LazyManifestFile(ManifestFile):
+    """ManifestFile that fetches MPY_LIB_DIR lazily and records require()'d
+    package metadata for the SBOM/license policy gate.
+
+    ManifestFile.__init__ resolves path_vars["MPY_LIB_DIR"] into concrete
+    add_library() search-root paths eagerly, before any manifest.py content
+    runs; but the directory those paths point at doesn't need to exist yet:
+    _require_from_path's os.walk() on a missing directory just yields
+    nothing. So MPY_LIB_DIR is always seeded with its real, deterministic
+    target path (mpy_lib_cache.mpy_lib_dir_path, zero network access), and
+    the actual fetch-and-cache (network access, only on a cold cache) is
+    deferred to here, inside require(), only when a require() call would
+    actually need to search under it. No static prescan of the manifest
+    source is needed, and this handles a require() reached through a nested
+    include() the same as a top-level one, since require() is intercepted
+    regardless of which manifest.py is currently executing.
+
+    A require() call needs MPY_LIB_DIR populated when either:
+      - library= is not given (falls back to the BASE_LIBRARY_NAMES search
+        roots registered from MPY_LIB_DIR at construction time), or
+      - library= names a library whose add_library()-registered path itself
+        lives under the MPY_LIB_DIR target: the canonical upstream idiom
+        add_library("unix-ffi", "$(MPY_LIB_DIR)/unix-ffi", prepend=True) +
+        require("ffilib", library="unix-ffi").
+
+    required_packages collects (name, ManifestPackageMetadata) for every
+    require() call. Attribution is correct even through nested/transitive
+    require() chains: metadata() is only intercepted while
+    _pending_require_names shows a require() call is in flight, and its top
+    entry always names whichever manifest.py is currently executing.
+    """
+
+    def __init__(
+        self,
+        *args,
+        mpy_lib_dir: "Path | None" = None,
+        mpy_lib_fetcher=None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        # self._libraries (base class) maps library name -> abspath'd
+        # directory string, populated by add_library(); comparing against it
+        # is how a require(library=...) call is recognised as needing
+        # MPY_LIB_DIR too. This is a deliberate coupling to ManifestFile's
+        # internals; see picolet/_vendor/README.md for how to re-verify it
+        # on a re-vendor.
+        self._mpy_lib_dir_target = str(mpy_lib_dir) if mpy_lib_dir else None
+        self._mpy_lib_fetcher = mpy_lib_fetcher
+        self._mpy_lib_ensured = False
+        self._pending_require_names: list[str] = []
+        self._recorded_metadata_ids: set[int] = set()
+        self.required_packages: list[tuple[str, object]] = []
+
+    def _library_needs_mpy_lib_dir(self, library: "str | None") -> bool:
+        if library is None:
+            return True
+        if self._mpy_lib_dir_target is None:
+            return False
+        lib_path = self._libraries.get(library)
+        if lib_path is None:
+            return False
+        target = self._mpy_lib_dir_target
+        return lib_path == target or lib_path.startswith(target + os.sep)
+
+    def require(self, name, version=None, pypi=None, library=None, **kwargs):
+        if (
+            not self._mpy_lib_ensured
+            and self._mpy_lib_fetcher is not None
+            and self._library_needs_mpy_lib_dir(library)
+        ):
+            self._mpy_lib_ensured = True
+            self._mpy_lib_fetcher()
+        self._pending_require_names.append(name)
+        try:
+            super().require(name, version=version, pypi=pypi, library=library, **kwargs)
+        finally:
+            self._pending_require_names.pop()
+
+    def metadata(self, **kwargs):
+        result = super().metadata(**kwargs)
+        if kwargs and self._pending_require_names:
+            frame = self._metadata[-1]
+            if id(frame) not in self._recorded_metadata_ids:
+                self._recorded_metadata_ids.add(id(frame))
+                self.required_packages.append((self._pending_require_names[-1], frame))
+        return result
+
+    def c_module(self, module_path):
+        """Reject c_module() explicitly rather than silently dropping it.
+
+        The base class's c_module() is a no-op outside MODE_FREEZE /
+        MODE_LIST_C_MODULES (it returns before recording anything), so a
+        manifest.py using it under MODE_COMPILE would otherwise "succeed"
+        with the module simply absent from the build; there is no way to
+        detect that after the fact via mf.c_modules().
+        """
+        raise ManifestFileError(
+            f"c_module({module_path!r}) is not supported in an app's "
+            f"manifest.py: picolet build only processes manifest.py in "
+            f"MODE_COMPILE, which freezes Python sources, not C modules. "
+            f"Remove this call."
+        )
+
+
+def _resolve_manifest(
+    app_root: Path, manifest_path: Path, config: dict, verbose: bool
+) -> ResolvedManifest:
+    """Run manifest.py in MODE_COMPILE; return its resolved files + packages.
+
+    MPY_LIB_DIR is always seeded with its real target path (see
+    _LazyManifestFile), computed with zero network access; the fetch (or
+    override validation) itself is deferred to the first require() call
+    that actually needs it.
+    """
+    mpy_lib_dir = mpy_lib_dir_path(config, app_root)
+
+    def fetcher() -> None:
+        # Deliberately lets MpyLibFetchError propagate uncaught: it's raised
+        # from inside a require() call, itself inside manifestfile.py's own
+        # exec() of the currently-processing manifest.py, which wraps any
+        # exception into ManifestFileError; that's the single error path
+        # this function's caller (_resolve_manifest) already handles below.
+        ensure_mpy_lib_dir(config, app_root, verbose=verbose)
+
+    mf = _LazyManifestFile(
+        MODE_COMPILE,
+        path_vars={"MPY_LIB_DIR": str(mpy_lib_dir)},
+        mpy_lib_dir=mpy_lib_dir,
+        mpy_lib_fetcher=fetcher,
+    )
+    try:
+        mf.execute(str(manifest_path))
+    except ManifestFileError as exc:
+        print(f"error: manifest.py: {exc}", file=sys.stderr)
+        raise BuildFailed()
+    files = [(Path(f.full_path), f.target_path) for f in mf.files()]
+    return ResolvedManifest(files=files, required_packages=mf.required_packages)
+
+
+def _compile_manifest_files(
+    resolved: list[tuple[Path, str]],
+    romfs_root: Path,
+    mpy_cross: Path,
+    verbose: bool,
+    *,
+    mpy_sources: "dict[Path, Path] | None" = None,
+) -> None:
+    """Compile manifest.py-resolved (src, target_path) pairs into romfs_root.
+
+    Every ManifestOutput produced in MODE_COMPILE is a .py file
+    (picolet._vendor.manifestfile._add_file() enforces this), so each entry
+    is cross-compiled to .mpy, same as _compile_mpy/_copy_includes; an
+    appended romfs never ships raw .py regardless of which pipeline step
+    produced it.
+    """
+    if mpy_sources is None:
+        mpy_sources = {}
+    for src, target_path in resolved:
+        romfs_target = Path(target_path).with_suffix(".mpy")
+        dst = romfs_root / romfs_target
+        _claim_mpy_dest(mpy_sources, dst, src, romfs_root)
+        _mpy_cross_compile(
+            mpy_cross, src, dst, verbose,
+            label=f"{target_path} (manifest) → romfs/{romfs_target}",
+        )
+
+
 def _compile_mpy(
     app_root: Path,
     entry_str: str,
@@ -972,6 +1295,8 @@ def _compile_mpy(
     mpy_cross: Path,
     excludes: list[str],
     verbose: bool,
+    *,
+    mpy_sources: "dict[Path, Path] | None" = None,
 ) -> None:
     """Compile all .py files under dirname(entry) → .mpy in romfs_root.
 
@@ -988,6 +1313,9 @@ def _compile_mpy(
          src/main.py            →  romfs_root/src/main.mpy
          src/main.py (entry)    →  romfs_root/main.mpy   (auto-run by runtime)
     """
+    if mpy_sources is None:
+        mpy_sources = {}
+
     entry = Path(entry_str)
     entry_abs = app_root / entry
     src_dir = app_root / entry.parent  # e.g. app_root/"src"
@@ -1012,13 +1340,10 @@ def _compile_mpy(
             continue
         rel = py.relative_to(app_root)          # e.g. src/main.py
         out_mpy = romfs_root / rel.with_suffix(".mpy")
-        out_mpy.parent.mkdir(parents=True, exist_ok=True)
-        if verbose:
-            print(f"  mpy-cross: {rel} → romfs/{rel.with_suffix('.mpy')}", file=sys.stderr)
-        subprocess.run(
-            [str(mpy_cross), "-o", str(out_mpy), str(py)],
-            check=True,
-            capture_output=not verbose,
+        _claim_mpy_dest(mpy_sources, out_mpy, py, romfs_root)
+        _mpy_cross_compile(
+            mpy_cross, py, out_mpy, verbose,
+            label=f"{rel} → romfs/{rel.with_suffix('.mpy')}",
         )
 
     # Compile the entry point to /rom/main.mpy (the runtime's auto-run location).
@@ -1029,6 +1354,7 @@ def _compile_mpy(
     # the /rom/main.mpy copy, so siblings are importable at runtime.
     romfs_root.mkdir(parents=True, exist_ok=True)
     entry_main_mpy = romfs_root / "main.mpy"
+    _claim_mpy_dest(mpy_sources, entry_main_mpy, entry_abs, romfs_root)
 
     # Derive the romfs dirname from the entry path.  If entry == "src/main.py"
     # then entry_dir_in_romfs == "src", and the path to prepend is "/rom/src".
@@ -1089,6 +1415,8 @@ def _copy_includes(
     romfs_root: Path,
     mpy_cross: Path,
     verbose: bool,
+    *,
+    mpy_sources: "dict[Path, Path] | None" = None,
 ) -> None:
     """Copy [romfs] include directories into romfs_root (FR-BP-4).
 
@@ -1107,11 +1435,15 @@ def _copy_includes(
     directory of that name and everything under it; "*.der" excludes files
     by extension anywhere in the tree. Matches claude-net-mpy's
     package-plugin.py _EXCLUDE_PATTERNS semantics.
+
+    mpy_sources: romfs .mpy destination -> its source file, to catch a .py
+    and a pre-existing .mpy (here, or from the entry tree, or from a
+    manifest.py require()) both resolving to the same romfs path (ambiguous
+    which one ships; see _claim_mpy_dest). Callers that don't pass one get a
+    dict scoped to this call only (this function's own historical behaviour).
     """
-    # romfs .mpy destination -> its source file, to catch a .py and a
-    # pre-existing .mpy in the source tree both resolving to the same romfs
-    # path (ambiguous which one ships; previously silent and order-dependent).
-    mpy_sources: dict[Path, Path] = {}
+    if mpy_sources is None:
+        mpy_sources = {}
 
     for inc in includes:
         src = app_root / inc
@@ -1141,29 +1473,15 @@ def _copy_includes(
             dst = romfs_root / (rel.with_suffix(".mpy") if f.suffix == ".py" else rel)
 
             if dst.suffix == ".mpy":
-                if dst in mpy_sources and mpy_sources[dst] != f:
-                    print(
-                        f"error: [romfs] include: {mpy_sources[dst]} and {f} "
-                        f"both resolve to romfs/{dst.relative_to(romfs_root)} "
-                        f"— ship only one",
-                        file=sys.stderr,
-                    )
-                    raise BuildFailed()
-                mpy_sources[dst] = f
+                _claim_mpy_dest(mpy_sources, dst, f, romfs_root)
 
-            dst.parent.mkdir(parents=True, exist_ok=True)
             if f.suffix == ".py":
-                if verbose:
-                    print(
-                        f"  mpy-cross: {rel} → romfs/{rel.with_suffix('.mpy')}",
-                        file=sys.stderr,
-                    )
-                subprocess.run(
-                    [str(mpy_cross), "-o", str(dst), str(f)],
-                    check=True,
-                    capture_output=not verbose,
+                _mpy_cross_compile(
+                    mpy_cross, f, dst, verbose,
+                    label=f"{rel} → romfs/{rel.with_suffix('.mpy')}",
                 )
             else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 if verbose:
                     print(f"  include: {rel} → romfs/{rel}", file=sys.stderr)
                 shutil.copy2(f, dst)
